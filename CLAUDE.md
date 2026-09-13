@@ -8,8 +8,6 @@ A data liberation sync engine: it extracts a user's Gmail data via OAuth2 into S
 
 The full functional/API spec lives in `CONTRACT.md` — read it before implementing any endpoint, the data model, or the sync logic; it is the source of truth for request/response shapes and error codes, not this file. `BUILD_SEQUENCE.md` lists the atomic build order and each unit's verification criterion.
 
-**Note:** `CONTRACT.md`'s Section 6 endpoint paths (e.g. `/api/messages`, `/webhooks/gmail/notifications`) predate the `/api/v1` + `/webhook/gmail` convention below. Where the two disagree, the conventions in this file are current — treat `CONTRACT.md`'s error envelope, data model, and sync semantics as authoritative, but its literal path strings as superseded.
-
 ## Stack
 
 Node 20, TypeScript (strict mode), Express, `googleapis`, `@supabase/supabase-js`, Jest + `supertest`, deployed via Vercel.

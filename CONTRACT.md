@@ -106,7 +106,7 @@ The project is complete only when all of the following are true:
 
 ### a) OAuth callback
 
-`GET /auth/google/callback`
+`GET /api/v1/auth/google/callback`
 
 **Auth:** none (this endpoint establishes auth).
 
@@ -130,7 +130,7 @@ The project is complete only when all of the following are true:
 
 ### b) List messages
 
-`GET /api/messages`
+`GET /api/v1/messages`
 
 **Auth:** JWT required (`vibemail_jwt` cookie or `Authorization: Bearer <jwt>`).
 
@@ -139,7 +139,7 @@ The project is complete only when all of the following are true:
 | Param | Type | Required | Default |
 |---|---|---|---|
 | limit | integer | no | 20 (max 100) |
-| offset | integer | no | 0 |
+| cursor | string | no | — (opaque cursor from a previous response's `nextCursor`; omit for the first page) |
 | label | string | no | — (e.g. `INBOX`, `SENT`; filters on `labelIds` containing this value) |
 | isRead | boolean | no | — (filters on `isRead`) |
 
@@ -147,9 +147,8 @@ The project is complete only when all of the following are true:
 ```json
 {
   "messages": [ /* StoredMessage[] */ ],
-  "total": 0,
-  "limit": 20,
-  "offset": 0
+  "nextCursor": null,
+  "limit": 20
 }
 ```
 
@@ -164,7 +163,7 @@ The project is complete only when all of the following are true:
 
 ### c) Send message
 
-`POST /api/messages/send`
+`POST /api/v1/messages/send`
 
 **Auth:** JWT required.
 
@@ -191,7 +190,7 @@ The project is complete only when all of the following are true:
 
 ### d) Mark as read
 
-`PATCH /api/messages/:id/read`
+`PATCH /api/v1/messages/:id/read`
 
 **Auth:** JWT required; the message must belong to the caller (`messages.userId` matches the JWT's `userId`).
 
@@ -210,9 +209,9 @@ The project is complete only when all of the following are true:
 
 ### e) Gmail Pub/Sub webhook
 
-`POST /webhooks/gmail/notifications`
+`POST /webhook/gmail`
 
-Not one of the four user-facing endpoints, but required to satisfy the no-polling / real-time-sync acceptance criteria — included here so both sessions build against it.
+Not one of the four user-facing endpoints, but required to satisfy the no-polling / real-time-sync acceptance criteria — included here so both sessions build against it. Lives outside `/api/v1` since it's a server-to-server Pub/Sub push target, not a client-facing endpoint.
 
 **Auth:** Google Cloud Pub/Sub authenticated push — the request carries an OIDC bearer token in `Authorization`, verified against the configured service account. *Assumption: OIDC push auth is used rather than a shared-secret URL, per Google's recommended setup; adjust if a different Pub/Sub auth scheme is preferred.*
 
@@ -274,7 +273,7 @@ Every authentication-failure code below is **typed and recoverable**: each maps 
 ## 8. Deployment
 
 The Express app is deployed to Vercel (as Vercel Functions / Fluid Compute running the standard Node.js runtime — no code changes needed to run Express there). This gives a stable public HTTPS URL used as both:
-- the Google OAuth redirect URI (`.../auth/google/callback`), and
-- the Gmail Pub/Sub push subscription endpoint (`.../webhooks/gmail/notifications`).
+- the Google OAuth redirect URI (`.../api/v1/auth/google/callback`), and
+- the Gmail Pub/Sub push subscription endpoint (`.../webhook/gmail`).
 
 Being "live on Vercel" per the acceptance criteria means: the app is deployed to a Vercel production deployment, environment variables (Google client id/secret, JWT secret, token-encryption key, Supabase connection string, Pub/Sub topic name) are configured in the Vercel project, and both URLs above are reachable and correctly registered with Google/Pub/Sub against that deployment's URL.
