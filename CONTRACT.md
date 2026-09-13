@@ -51,9 +51,9 @@ The project is complete only when all of the following are true:
 | email | text | Google OAuth token info / Gmail profile |
 | googleAccessToken | text (encrypted at rest, e.g. AES-256-GCM with a key from env/KMS) | OAuth token exchange response |
 | googleRefreshToken | text (encrypted at rest, same scheme) | OAuth token exchange response |
-| googleTokenExpiresAt | timestamptz | OAuth token exchange response (`expires_in` → absolute time) |
+| googleTokenExpiresAt | timestamptz | OAuth token exchange response — use `tokens.expiry_date` from `google-auth-library`'s `getToken()` result directly (it already computes the absolute time from `expires_in`; don't re-derive it) |
 | lastHistoryId | text, nullable | Gmail `historyId` — seeded from the initial sync, advanced by each processed Pub/Sub notification; the resume point for `users.history.list` |
-| watchExpiration | timestamptz, nullable | Gmail `users.watch()` response `expiration` — Gmail requires the watch to be renewed at least every 7 days |
+| watchExpiration | timestamptz, nullable | Gmail `users.watch()` response `expiration` — a string epoch-millis value (`Schema$WatchResponse.expiration: string \| null`), parse it before converting to a timestamp. Gmail requires the watch to be renewed at least every 7 days |
 | createdAt | timestamptz | internal — row insert time |
 
 ### `messages`
@@ -68,8 +68,8 @@ The project is complete only when all of the following are true:
 | fromAddress | text | Gmail `payload.headers[name=From].value` |
 | toAddress | text | Gmail `payload.headers[name=To].value` |
 | snippet | text, nullable | Gmail `message.snippet` |
-| bodyText | text, nullable | Gmail `payload.parts[mimeType=text/plain].body.data` (base64url-decoded) |
-| bodyHtml | text, nullable | Gmail `payload.parts[mimeType=text/html].body.data` (base64url-decoded) |
+| bodyText | text, nullable | Gmail `payload.parts[mimeType=text/plain].body.data` (base64url-decoded); MIME parts can nest recursively (e.g. `multipart/mixed` wrapping `multipart/alternative` on messages with attachments), so this requires a recursive walk of `payload.parts[].parts[]`, not a single flat lookup |
+| bodyHtml | text, nullable | Gmail `payload.parts[mimeType=text/html].body.data` (base64url-decoded); same recursive-walk note as `bodyText` |
 | labelIds | text[] | Gmail `message.labelIds` |
 | isRead | boolean | derived: `NOT ("UNREAD" IN message.labelIds)`, kept current by both the mark-as-read endpoint and Pub/Sub history processing |
 | internalDate | timestamptz | Gmail `message.internalDate` (epoch ms → timestamp) |
@@ -88,13 +88,15 @@ The project is complete only when all of the following are true:
 
 *Assumption: this runs synchronously within the callback request for v1 simplicity (acceptable at 50 messages); revisit if latency becomes a problem.*
 
-**Ongoing sync (no polling):** Google Cloud Pub/Sub is configured with a topic that Gmail's `watch()` publishes to, and a push subscription pointing at `POST /webhooks/gmail/notifications` (Section 6e). Each push delivers `{ emailAddress, historyId }`. The handler:
+**Ongoing sync (no polling):** Google Cloud Pub/Sub is configured with a topic that Gmail's `watch()` publishes to, and a push subscription pointing at `POST /webhook/gmail` (Section 6e). Each push delivers `{ emailAddress, historyId }`. The handler:
 1. Looks up the user by `emailAddress`.
-2. Calls `users.history.list(startHistoryId = users.lastHistoryId)`.
+2. Calls `users.history.list(startHistoryId = users.lastHistoryId)`. `history.list` is paginated (`maxResults` defaults to 100, max 500) — if the response includes a `nextPageToken`, keep calling with that token until it's absent before considering the batch fully processed; a single unpaginated call can silently miss changes on an active mailbox.
 3. For each `messagesAdded` record: fetch and insert the new message as `direction: "inbound"` (this is how new mail arrives — no polling loop anywhere).
 4. For each history record with `labelsRemoved` containing `UNREAD`: set that message's `isRead = true` locally (Gmail→app read sync).
 5. For each history record with `labelsAdded` containing `UNREAD`: set that message's `isRead = false` locally.
-6. Advance `users.lastHistoryId` to the latest `historyId` processed.
+6. Advance `users.lastHistoryId` to the final page's response `historyId` field (the mailbox's current history record ID) — not a value derived from individual history record IDs.
+
+**Stale `startHistoryId` (full re-sync fallback):** a `startHistoryId` that Gmail no longer recognizes (expired or invalid) makes `users.history.list` return `HTTP 404`. Per Gmail's documented guidance, this is a signal to perform a full re-sync, not a transient failure to retry as-is: on a 404 from `history.list`, the webhook handler must re-run the initial-sync procedure above (re-fetch the most recent messages, re-issue `users.watch()`, and reseed `lastHistoryId`/`watchExpiration`) rather than surfacing `gmail_history_fetch_failed`. `lastHistoryId` is typically valid for at least a week but can expire sooner in rare cases, so this path is not just a theoretical edge case.
 
 **Watch renewal:** `users.watchExpiration` must be checked and `users.watch()` re-issued before it lapses (Gmail's 7-day max). *Assumption: a scheduled job (e.g. Vercel Cron) handles renewal; exact scheduling mechanism is an implementation detail left to session 1, not part of this contract's typed surface.*
 
@@ -227,7 +229,9 @@ Not one of the four user-facing endpoints, but required to satisfy the no-pollin
 }
 ```
 
-**Response 200:** empty body — acknowledges the message so Pub/Sub does not redeliver. **Note:** an `emailAddress` that matches no known user is acked with 200 (no-op) rather than returning 404, to avoid Pub/Sub retry storms on stale subscriptions.
+**Response 200:** empty body — acknowledges the message so Pub/Sub does not redeliver. **Notes:**
+- An `emailAddress` that matches no known user is acked with 200 (no-op) rather than returning 404, to avoid Pub/Sub retry storms on stale subscriptions.
+- A `404` from `users.history.list` (expired/invalid `startHistoryId`, see Section 5's stale-`startHistoryId` fallback) is not surfaced as an error to Pub/Sub: the handler performs the full re-sync fallback and still acks 200 on success, so Pub/Sub doesn't redeliver a notification that was actually handled.
 
 **Typed errors:**
 
@@ -235,7 +239,7 @@ Not one of the four user-facing endpoints, but required to satisfy the no-pollin
 |---|---|---|
 | 401 | `invalid_pubsub_token` | OIDC token missing or failed verification |
 | 400 | `malformed_notification` | `data` is not valid base64/JSON or missing `emailAddress`/`historyId` |
-| 502 | `gmail_history_fetch_failed` | `users.history.list` call failed |
+| 502 | `gmail_history_fetch_failed` | `users.history.list` call failed for a reason other than an expired `startHistoryId` (e.g. network/API error), or the Section 5 full re-sync fallback itself failed |
 
 ## 7. Shared Error Envelope
 
